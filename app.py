@@ -146,16 +146,24 @@ def load_gis_data(data_dir: str, pattern: str, label: str):
     if not HAS_GIS:
         return None
 
+    # アプリのディレクトリ基準でもdata/を探す
+    possible_dirs = [data_dir]
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_dirs.append(os.path.join(app_dir, "data"))
+    possible_dirs.append(os.path.join(app_dir, data_dir))
+
     files = []
-    for ext in ["*.shp", "*.geojson", "*.json"]:
-        found = glob.glob(os.path.join(data_dir, pattern, ext))
-        files.extend(found)
-    # パターンなしでも直接検索
-    if not files:
+    for d in possible_dirs:
+        if not os.path.exists(d):
+            continue
         for ext in ["*.shp", "*.geojson", "*.json"]:
-            found = glob.glob(os.path.join(data_dir, ext))
-            # ファイル名にキーワードが含まれるものだけ
-            files.extend([f for f in found if label.lower() in f.lower()])
+            # サブフォルダも含めて検索
+            found = glob.glob(os.path.join(d, "**", ext), recursive=True)
+            found += glob.glob(os.path.join(d, ext))
+            for f in found:
+                fname = os.path.basename(f).lower()
+                if label.lower() in fname and f not in files:
+                    files.append(f)
 
     if not files:
         return None
@@ -315,7 +323,9 @@ with st.sidebar:
             st.warning("自然公園: データ未配置")
 
         # 景観計画区域データ
-        landscape_gdf = load_gis_data(data_dir, "*", "A34")
+        landscape_gdf = load_gis_data(data_dir, "*", "A35")
+        if landscape_gdf is None:
+            landscape_gdf = load_gis_data(data_dir, "*", "A34")
         if landscape_gdf is None:
             landscape_gdf = load_gis_data(data_dir, "*", "景観")
         if landscape_gdf is None:
