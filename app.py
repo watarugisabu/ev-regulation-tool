@@ -1,14 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-EV充電器設置工事 規制区域自動判定ツール v3.1
+EV充電器設置工事 規制区域自動判定ツール v3.3
 
-v3.1の変更点:
-- 緯度・経度の直接入力に対応（精度向上）
-- 入力モード自動判別:
-  * 緯度・経度列があれば優先使用
-  * なければ住所列をジオコーディング
-- 番地未入力の住所を検出して警告フラグを立てる
-- 公園名（OBJ_NAME）の表示に対応
+v3.3の変更点:
+- 景観計画データを全国版（A35a_ALL_Japan.geojson.gz）に対応
+- gzip圧縮された景観計画データの読み込みに対応
 """
 
 import os
@@ -48,28 +44,55 @@ from ksj_codes import (
 
 
 # =============================================================================
+# 確認用URL生成関数
+# =============================================================================
+EADAS_TOP_URL = "https://eadas.env.go.jp/eiadb/ebidbs/"
+
+
+def build_gsi_map_url(lat, lng, zoom=16):
+    if lat is None or lng is None:
+        return ""
+    return f"https://maps.gsi.go.jp/#{zoom}/{lat:.6f}/{lng:.6f}/&base=std&ls=std"
+
+
+def build_google_map_url(lat, lng):
+    if lat is None or lng is None:
+        return ""
+    return f"https://www.google.com/maps/search/?api=1&query={lat:.6f},{lng:.6f}"
+
+
+def build_eadas_url():
+    return EADAS_TOP_URL
+
+
+# =============================================================================
 # カラム候補
 # =============================================================================
-# A10標準属性（旧）+ 元データ属性（新）の両方に対応
 PARK_CLASS_COL_CANDIDATES = [
     "A10_003", "A10-10_003", "A10_15_003", "A10-15_003",
     "naturalParkClassCode",
 ]
 PARK_NAME_COL_CANDIDATES = [
-    "OBJ_NAME",  # A10-15で実際に使われている公園名
+    "OBJ_NAME",
     "A10_005", "A10-10_005", "A10_15_005", "A10-15_005",
     "naturalParkNameCode",
 ]
 LAYER_CD_COL_CANDIDATES = ["layer_cd", "LAYER_NO"]
 PREF_CD_COL_CANDIDATES = ["pref_cd", "PREFEC_CD", "A10_001", "A10_15_001"]
-CTV_NAME_COL_CANDIDATES = ["CTV_NAME"]  # 市町村名
+CTV_NAME_COL_CANDIDATES = ["CTV_NAME"]
 
 LANDSCAPE_ORG_COL_CANDIDATES = [
     "A35a_003", "A35b_003", "A35c_003",
     "A35d_003", "A35e_003", "A35f_003",
+    "A35a-14_003", "A35b-14_003", "A35d-14_003", "A35e-14_003", "A35f-14_003",
 ]
 LANDSCAPE_STATUS_COL_CANDIDATES = [
     "A35a_007", "A35b_007", "A35d_007", "A35e_007", "A35f_007",
+    "A35a-14_007", "A35b-14_007",
+]
+LANDSCAPE_PREF_COL_CANDIDATES = [
+    "A35a_002", "A35b_002", "A35d_002", "A35e_002", "A35f_002",
+    "pref_cd",
 ]
 
 
@@ -86,50 +109,28 @@ def pick_first_value(row, candidates):
 # 番地検出
 # =============================================================================
 def has_banchi(address: str) -> bool:
-    """住所に番地（地番・住居番号）が含まれているかチェック
-
-    番地と判定するパターン:
-    - 末尾付近に1桁以上の数字がある（例: 「強羅1300」「西新宿2-8-1」）
-    - 「番地」「番」「号」「丁目」などのキーワード+数字
-    - 「-」「ー」を含む数字パターン
-
-    番地なしと判定するパターン:
-    - 数字を全く含まない
-    - 数字が「都道府県コード」だけ（例: 「13区」など末尾以外の数字）
-    - 「町」「村」までで終わる
-    """
     if not address or not isinstance(address, str):
         return False
-
     addr = address.strip()
     if not addr:
         return False
-
-    # パターン1: 数字+「丁目」「番地」「番」「号」を含む
     if re.search(r"\d+\s*(丁目|番地|番|号)", addr):
         return True
-
-    # パターン2: 末尾付近に1〜数桁の数字がある
-    # 末尾10文字以内に「\d+」があれば番地らしい
     last_part = addr[-15:]
     if re.search(r"\d+(-\d+)*\s*$", last_part) or re.search(r"\d+(-\d+)+", last_part):
         return True
-
-    # パターン3: 「-」または「ー」で繋がれた数字
     if re.search(r"\d+[\-ー]\d+", addr):
         return True
-
     return False
 
 
 def parse_lat_lng(value):
-    """値を緯度または経度の数値に変換できればfloatで返す"""
     if value is None:
         return None
     try:
         if isinstance(value, (int, float)):
             f = float(value)
-            if f != f:  # NaN
+            if f != f:
                 return None
             return f
         s = str(value).strip()
@@ -141,10 +142,8 @@ def parse_lat_lng(value):
 
 
 def is_valid_japan_coords(lat, lng):
-    """日本国内の妥当な緯度経度かチェック（粗いチェック）"""
     if lat is None or lng is None:
         return False
-    # 日本の概略範囲: 緯度20〜46度、経度122〜154度
     if not (20 <= lat <= 46):
         return False
     if not (122 <= lng <= 154):
@@ -175,11 +174,23 @@ st.markdown("""
 # =============================================================================
 # データ読み込み
 # =============================================================================
+def _read_geojson_or_shp(path):
+    """GeoJSON / gzip GeoJSON / Shapefileを統一的に読み込む"""
+    if path.endswith(".gz"):
+        with gzip.open(path, "rb") as f:
+            data_bytes = f.read()
+        return gpd.read_file(io.BytesIO(data_bytes))
+    else:
+        try:
+            return gpd.read_file(path, encoding="cp932")
+        except Exception:
+            return gpd.read_file(path)
+
+
 @st.cache_data(show_spinner=False)
 def load_natural_park_gdf(data_dir: str):
     if not HAS_GIS or not os.path.isdir(data_dir):
         return None
-
     candidates = []
     for pat in ["*A10*park*optimized*.geojson.gz", "*A10*park*.geojson.gz", "*A10*.geojson.gz"]:
         candidates.extend(glob.glob(os.path.join(data_dir, "**", pat), recursive=True))
@@ -191,7 +202,6 @@ def load_natural_park_gdf(data_dir: str):
 
     if not candidates:
         return None
-
     seen = set()
     ordered = []
     for c in candidates:
@@ -201,15 +211,7 @@ def load_natural_park_gdf(data_dir: str):
     path = ordered[0]
 
     try:
-        if path.endswith(".gz"):
-            with gzip.open(path, "rb") as f:
-                data_bytes = f.read()
-            gdf = gpd.read_file(io.BytesIO(data_bytes))
-        else:
-            try:
-                gdf = gpd.read_file(path, encoding="cp932")
-            except Exception:
-                gdf = gpd.read_file(path)
+        gdf = _read_geojson_or_shp(path)
     except Exception as e:
         st.error(f"自然公園データ読み込みエラー: {e}")
         return None
@@ -225,14 +227,52 @@ def load_natural_park_gdf(data_dir: str):
 
 @st.cache_data(show_spinner=False)
 def load_landscape_gdf(data_dir: str):
+    """A35a 全国統合GeoJSON（gzip）または個別Shapefileを読み込む"""
     if not HAS_GIS or not os.path.isdir(data_dir):
         return None
-    patterns = [
+
+    # 優先順: 全国統合gzip > 全国統合GeoJSON > 個別Shapefile
+    candidates = []
+    for pat in ["*A35a*ALL*.geojson.gz", "*A35*ALL*.geojson.gz",
+                "*A35*Japan*.geojson.gz", "*A35*all*.geojson.gz"]:
+        candidates.extend(glob.glob(os.path.join(data_dir, "**", pat), recursive=True))
+    for pat in ["*A35a*ALL*.geojson", "*A35*ALL*.geojson",
+                "*A35*Japan*.geojson", "*A35*all*.geojson"]:
+        candidates.extend(glob.glob(os.path.join(data_dir, "**", pat), recursive=True))
+    # gzipの個別ファイルもサポート
+    for pat in ["*A35*.geojson.gz", "*A35*.geojson"]:
+        candidates.extend(glob.glob(os.path.join(data_dir, "**", pat), recursive=True))
+    # フォールバック: 個別Shapefile
+    fallback_patterns = [
         "*A35a*.shp", "*A35b*.shp", "*A35d*.shp", "*A35e*.shp", "*A35f*.shp",
         "*A35*.shp", "*Landscape*.shp", "*景観*.shp",
     ]
-    candidates = []
-    for pat in patterns:
+
+    # 統合GeoJSON系がある場合はそれを優先
+    seen = set()
+    ordered = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            ordered.append(c)
+
+    if ordered:
+        path = ordered[0]
+        try:
+            gdf = _read_geojson_or_shp(path)
+            if gdf is not None and not gdf.empty:
+                if gdf.crs is None:
+                    gdf.set_crs(epsg=4326, inplace=True)
+                elif gdf.crs.to_epsg() != 4326:
+                    gdf = gdf.to_crs(epsg=4326)
+                gdf.attrs["source_file"] = path
+                return gdf
+        except Exception as e:
+            st.warning(f"景観計画データ（統合版）の読み込みに失敗、個別ファイルにフォールバック: {e}")
+
+    # フォールバック: 個別Shapefileから最大件数のものを選ぶ
+    shp_candidates = []
+    for pat in fallback_patterns:
         for shp in glob.glob(os.path.join(data_dir, "**", pat), recursive=True):
             try:
                 gdf = gpd.read_file(shp, encoding="cp932")
@@ -250,11 +290,12 @@ def load_landscape_gdf(data_dir: str):
             except Exception:
                 continue
             gdf.attrs["source_file"] = shp
-            candidates.append((shp, gdf))
-    if not candidates:
+            shp_candidates.append((shp, gdf))
+
+    if not shp_candidates:
         return None
-    candidates.sort(key=lambda x: len(x[1]), reverse=True)
-    gdf = candidates[0][1]
+    shp_candidates.sort(key=lambda x: len(x[1]), reverse=True)
+    gdf = shp_candidates[0][1]
     if gdf.crs is None:
         gdf.set_crs(epsg=4326, inplace=True)
     elif gdf.crs.to_epsg() != 4326:
@@ -309,18 +350,15 @@ def lookup_natural_park(lat, lng, park_gdf):
     for _, row in hits.iterrows():
         lcd, _ = pick_first_value(row, LAYER_CD_COL_CANDIDATES)
         if lcd:
-            # LAYER_NOの値（21,22,23）を11/12/13に正規化
             if lcd in ("21", "22", "23"):
-                lcd = lcd.replace("2", "1", 1)  # 21->11, 22->12, 23->13
+                lcd = lcd.replace("2", "1", 1)
             layer_codes.add(lcd)
 
-        # OBJ_NAME（公園名そのもの）
         if "OBJ_NAME" in row.index:
             v = row["OBJ_NAME"]
             if pd.notna(v) and str(v).strip() not in ("", "nan", "None"):
                 park_names_obj.add(str(v).strip())
 
-        # コード由来の名前（フォールバック）
         for cand in ["A10_005", "A10_15_005", "naturalParkNameCode"]:
             if cand in row.index:
                 v = row[cand]
@@ -340,7 +378,6 @@ def lookup_natural_park(lat, lng, park_gdf):
 
     area_type = determine_area_type_by_layers(layer_codes) or "区分不明"
 
-    # 公園名: OBJ_NAMEを優先、なければコード変換
     if park_names_obj:
         park_name_display = " / ".join(sorted(park_names_obj))
     else:
@@ -371,28 +408,62 @@ def lookup_natural_park(lat, lng, park_gdf):
 
 
 def lookup_landscape(lat, lng, landscape_gdf):
-    result = {"該当": False, "行政団体": "", "条例名": "", "策定状況": "", "詳細": ""}
+    result = {"該当": False, "行政団体": "", "条例名": "", "策定状況": "",
+              "都道府県": "", "詳細": ""}
     if landscape_gdf is None or lat is None or lng is None or not HAS_GIS:
         return result
-
     try:
         point = Point(lng, lat)
         mask = landscape_gdf.geometry.contains(point) | landscape_gdf.geometry.intersects(point)
         hits = landscape_gdf[mask]
     except Exception:
         return result
-
     if hits.empty:
         return result
 
-    row = hits.iloc[0]
-    org_name, _ = pick_first_value(row, LANDSCAPE_ORG_COL_CANDIDATES)
-    status_code, _ = pick_first_value(row, LANDSCAPE_STATUS_COL_CANDIDATES)
+    # 複数ヒット時はすべての団体名を集約
+    org_names = set()
+    pref_codes = set()
+    statuses = set()
+
+    for _, row in hits.iterrows():
+        org, _ = pick_first_value(row, LANDSCAPE_ORG_COL_CANDIDATES)
+        if org:
+            org_names.add(org)
+        pref, _ = pick_first_value(row, LANDSCAPE_PREF_COL_CANDIDATES)
+        if pref:
+            pref_codes.add(pref)
+        status, _ = pick_first_value(row, LANDSCAPE_STATUS_COL_CANDIDATES)
+        if status:
+            statuses.add(status)
+
+    org_display = " / ".join(sorted(org_names)) if org_names else "（団体名不明）"
+    pref_labels = [translate_prefecture(c) for c in pref_codes]
+    pref_display = " / ".join(sorted(set([p for p in pref_labels if p])))
+
+    # 複数の条例を集約
+    ordinances = set()
+    for org in org_names:
+        ordinance = get_landscape_ordinance(org)
+        if ordinance:
+            ordinances.add(ordinance)
+    ordinance_display = " / ".join(sorted(ordinances))
+
+    # 策定状況: 「策定済み」が含まれていれば優先
+    status_display = ""
+    if statuses:
+        status_labels = [translate_landscape_plan_status(s) for s in statuses]
+        status_labels = [s for s in status_labels if s]
+        if "景観計画策定済み" in status_labels:
+            status_display = "景観計画策定済み"
+        elif status_labels:
+            status_display = " / ".join(sorted(set(status_labels)))
 
     result["該当"] = True
-    result["行政団体"] = org_name if org_name else "（団体名不明）"
-    result["条例名"] = get_landscape_ordinance(org_name) if org_name else ""
-    result["策定状況"] = translate_landscape_plan_status(status_code) if status_code else ""
+    result["行政団体"] = org_display
+    result["条例名"] = ordinance_display
+    result["策定状況"] = status_display
+    result["都道府県"] = pref_display
     if len(hits) > 1:
         result["詳細"] = f"{len(hits)}件の区域に該当"
     return result
@@ -403,7 +474,6 @@ def lookup_landscape(lat, lng, landscape_gdf):
 # =============================================================================
 with st.sidebar:
     st.markdown("### ⚙️ 設定")
-
     candidates = ["data", "./data", "/mount/src/ev-regulation-tool/data", "../data"]
     data_dir = next((c for c in candidates if os.path.isdir(c)), "data")
     st.markdown(f"**データフォルダ:** `{data_dir}`")
@@ -447,12 +517,24 @@ with st.sidebar:
         if landscape_gdf is not None:
             st.markdown("**🎨 景観計画データ**")
             st.code(str(list(landscape_gdf.columns)))
+            if "pref_cd" in landscape_gdf.columns:
+                pc = landscape_gdf["pref_cd"].value_counts().sort_index()
+                st.markdown("**都道府県別件数（上位10）:**")
+                for code, n in list(pc.items())[:10]:
+                    label = translate_prefecture(code)
+                    st.caption(f"  {code} {label}: {n:,}件")
+
+    st.markdown("---")
+    st.markdown("#### 🔗 確認URL設定")
+    show_eadas = st.checkbox("EADASリンクを含める", value=True)
+    show_gsi = st.checkbox("地理院地図リンクを含める", value=True)
+    show_gmap = st.checkbox("Googleマップリンクを含める", value=True)
+    only_hit = st.checkbox("該当ありの案件のみリンク表示", value=False)
 
     st.markdown("---")
     geocode_delay = st.slider(
         "API呼び出し間隔（秒）",
         min_value=0.3, max_value=3.0, value=1.0, step=0.1,
-        help="緯度経度入力の場合はAPIを使わないため設定無視"
     )
 
 
@@ -461,12 +543,13 @@ with st.sidebar:
 # =============================================================================
 st.markdown('<div class="main-header">⚡ EV充電器設置工事 規制区域自動判定ツール</div>', unsafe_allow_html=True)
 
-st.success("🆕 **v3.1**：緯度経度入力に対応。番地未入力住所を自動検出。")
+st.success("🆕 **v3.3**：景観計画データを全国版に更新（A35a全47都道府県）")
 
 st.markdown("""
 住所リスト（Excel/CSV）をアップロードすると、各住所が以下の規制区域に該当するかを自動判定します。
-- **入力モード自動判別**：「緯度」「経度」列があれば優先使用、なければ住所列をジオコーディング
-- **番地検出**：番地が入力されていない住所には警告フラグを表示
+- **自然公園区域**（A10-15、全国）
+- **景観計画区域**（A35a、全国）
+- **確認用URL**：地理院地図/Googleマップ/EADASへのリンク自動生成
 """)
 
 st.markdown("### 📂 住所リストのアップロード")
@@ -495,14 +578,9 @@ if uploaded_file is not None:
 
 
 if df_input is not None:
-    # === 入力モードの自動判別 ===
     cols = list(df_input.columns)
-
-    # 緯度・経度の列を検索
     lat_col_candidates = [c for c in cols if any(kw in str(c) for kw in ["緯度", "lat", "Lat", "LAT", "Y座標", "y座標"])]
     lng_col_candidates = [c for c in cols if any(kw in str(c) for kw in ["経度", "lng", "lon", "Lng", "Lon", "LNG", "LON", "X座標", "x座標"])]
-
-    # 住所列を検索
     addr_col_candidates = [c for c in cols if any(kw in str(c) for kw in ["住所", "address", "Address", "所在地"])]
 
     has_latlng = bool(lat_col_candidates) and bool(lng_col_candidates)
@@ -510,17 +588,13 @@ if df_input is not None:
 
     st.markdown("### 🎯 入力モード")
     if has_latlng and has_addr:
-        st.info(f"🔵 **緯度経度モード** + **住所モード（補助）**：緯度経度を優先使用、欠損は住所からジオコーディング")
-        mode = "auto"
+        st.info("🔵 **緯度経度モード** + **住所モード（補助）**")
     elif has_latlng:
-        st.info(f"🔵 **緯度経度モード**")
-        mode = "latlng"
+        st.info("🔵 **緯度経度モード**")
     elif has_addr:
-        st.info(f"🟢 **住所モード**：国土地理院APIでジオコーディング")
-        mode = "address"
+        st.info("🟢 **住所モード**")
     else:
         st.warning("⚠️ 緯度経度列も住所列も自動認識できませんでした。手動で列を指定してください。")
-        mode = "manual"
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -553,12 +627,10 @@ if df_input is not None:
             status = st.empty()
 
             for i, row in df_input.iterrows():
-                # === 座標取得 ===
                 lat, lng = None, None
                 coord_source = ""
                 banchi_warning = ""
 
-                # 1) 緯度経度列があれば優先使用
                 if lat_col != "（使わない）" and lng_col != "（使わない）":
                     lat_val = parse_lat_lng(row.get(lat_col))
                     lng_val = parse_lat_lng(row.get(lng_col))
@@ -566,30 +638,30 @@ if df_input is not None:
                         lat, lng = lat_val, lng_val
                         coord_source = "緯度経度入力"
 
-                # 2) 緯度経度がなければ住所からジオコーディング
                 addr = ""
                 if (lat is None or lng is None) and addr_col != "（使わない）":
                     addr = str(row.get(addr_col, "")).strip() if pd.notna(row.get(addr_col)) else ""
                     if addr:
                         status.text(f"判定中 ({i+1}/{len(df_input)}): {addr[:40]}")
-
-                        # 番地検出
                         if not has_banchi(addr):
                             banchi_warning = "番地未入力"
-
                         lat, lng = geocode_address_gsi(addr)
                         time.sleep(geocode_delay)
                         coord_source = "住所→ジオコーディング"
                     else:
                         coord_source = "住所空欄"
 
+                if banchi_warning == "" and addr_col != "（使わない）":
+                    addr_check = str(row.get(addr_col, "")).strip() if pd.notna(row.get(addr_col)) else ""
+                    if addr_check and not has_banchi(addr_check):
+                        banchi_warning = "番地未入力"
+
                 if lat is None or lng is None:
                     coord_source = coord_source or "座標取得失敗"
 
-                if not status.empty and (i % 5 == 0):
+                if i % 5 == 0:
                     status.text(f"判定中 ({i+1}/{len(df_input)})")
 
-                # === 判定 ===
                 np_result = lookup_natural_park(lat, lng, park_gdf)
                 ls_result = lookup_landscape(lat, lng, landscape_gdf)
 
@@ -598,7 +670,6 @@ if df_input is not None:
                 result_row["経度"] = lng
                 result_row["座標取得元"] = coord_source
 
-                # 番地警告
                 if banchi_warning:
                     result_row["住所精度"] = "⚠️ 番地未入力"
                 else:
@@ -616,9 +687,9 @@ if df_input is not None:
                 result_row["景観計画_行政団体"] = ls_result["行政団体"]
                 result_row["景観計画_条例名"] = ls_result["条例名"]
                 result_row["景観計画_策定状況"] = ls_result["策定状況"]
+                result_row["景観計画_都道府県"] = ls_result["都道府県"]
                 result_row["景観計画_備考"] = ls_result["詳細"]
 
-                # === 総合判定 ===
                 if lat is None or lng is None:
                     overall = "判定不可（座標取得失敗）"
                 else:
@@ -636,12 +707,27 @@ if df_input is not None:
                         overall = "要届出（景観計画区域）"
                     else:
                         overall = "規制区域外"
-
-                    # 番地未入力の場合は注記を追加
                     if banchi_warning:
                         overall = f"{overall} ⚠️要確認（番地未入力）"
-
                 result_row["総合判定"] = overall
+
+                is_hit = np_result["該当"] or ls_result["該当"]
+                show_link = (not only_hit) or is_hit
+
+                if lat is not None and lng is not None and show_link:
+                    if show_gsi:
+                        result_row["地理院地図"] = build_gsi_map_url(lat, lng)
+                    if show_gmap:
+                        result_row["Googleマップ"] = build_google_map_url(lat, lng)
+                    if show_eadas:
+                        result_row["EADAS"] = build_eadas_url()
+                else:
+                    if show_gsi:
+                        result_row["地理院地図"] = ""
+                    if show_gmap:
+                        result_row["Googleマップ"] = ""
+                    if show_eadas:
+                        result_row["EADAS"] = ""
 
                 results.append(result_row)
                 progress.progress((i + 1) / len(df_input))
@@ -670,8 +756,10 @@ if "df_result" in st.session_state:
         "総合判定", "住所精度", "座標取得元",
         "自然公園_該当", "自然公園_公園名", "自然公園_地域種別", "自然公園_公園区分",
         "自然公園_都道府県", "自然公園_市町村", "自然公園_備考",
-        "景観計画_該当", "景観計画_行政団体", "景観計画_条例名", "景観計画_策定状況", "景観計画_備考",
+        "景観計画_該当", "景観計画_行政団体", "景観計画_条例名", "景観計画_策定状況",
+        "景観計画_都道府県", "景観計画_備考",
         "緯度", "経度",
+        "地理院地図", "Googleマップ", "EADAS",
     ]
     show_cols = []
     for c in df_result.columns:
@@ -681,7 +769,23 @@ if "df_result" in st.session_state:
         if c in df_result.columns:
             show_cols.append(c)
 
-    st.dataframe(df_result[show_cols], use_container_width=True)
+    df_display = df_result[show_cols].copy()
+
+    column_config = {}
+    if "地理院地図" in df_display.columns:
+        column_config["地理院地図"] = st.column_config.LinkColumn(
+            "地理院地図", display_text="🗺️ 開く"
+        )
+    if "Googleマップ" in df_display.columns:
+        column_config["Googleマップ"] = st.column_config.LinkColumn(
+            "Googleマップ", display_text="📍 開く"
+        )
+    if "EADAS" in df_display.columns:
+        column_config["EADAS"] = st.column_config.LinkColumn(
+            "EADAS", display_text="🌐 開く"
+        )
+
+    st.dataframe(df_display, use_container_width=True, column_config=column_config)
 
     if HAS_FOLIUM:
         st.markdown("### 🗺️ 地図表示")
@@ -708,6 +812,10 @@ if "df_result" in st.session_state:
                     <b>市町村:</b> {row.get('自然公園_市町村', '')}<br>
                     <b>景観行政団体:</b> {row.get('景観計画_行政団体', '')}<br>
                     """
+                    if row.get("地理院地図"):
+                        popup_html += f'<a href="{row["地理院地図"]}" target="_blank">🗺️ 地理院地図で開く</a><br>'
+                    if row.get("EADAS"):
+                        popup_html += f'<a href="{row["EADAS"]}" target="_blank">🌐 EADASで開く</a>'
                     folium.Marker(
                         [row["緯度"], row["経度"]],
                         popup=folium.Popup(popup_html, max_width=350),
@@ -718,12 +826,37 @@ if "df_result" in st.session_state:
             st.warning(f"地図表示でエラー: {e}")
 
     st.markdown("### 💾 結果のダウンロード")
+
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df_result[show_cols].to_excel(writer, sheet_name="判定結果", index=False)
+        df_excel = df_result[show_cols].copy()
+        for url_col, label in [
+            ("地理院地図", "🗺️ 地理院地図"),
+            ("Googleマップ", "📍 Googleマップ"),
+            ("EADAS", "🌐 EADAS"),
+        ]:
+            if url_col in df_excel.columns:
+                df_excel[url_col] = df_excel[url_col].apply(
+                    lambda u: f'=HYPERLINK("{u}","{label}")' if u and isinstance(u, str) and u.startswith("http") else ""
+                )
+        df_excel.to_excel(writer, sheet_name="判定結果", index=False)
+
+        ws = writer.sheets["判定結果"]
+        for col_idx, col_name in enumerate(df_excel.columns, start=1):
+            try:
+                col_letter = ws.cell(row=1, column=col_idx).column_letter
+                if col_name in ("地理院地図", "Googleマップ", "EADAS"):
+                    ws.column_dimensions[col_letter].width = 18
+                elif "備考" in str(col_name) or "条例" in str(col_name):
+                    ws.column_dimensions[col_letter].width = 35
+                else:
+                    ws.column_dimensions[col_letter].width = 15
+            except Exception:
+                pass
+
     buf.seek(0)
     st.download_button(
-        "📥 Excelでダウンロード",
+        "📥 Excelでダウンロード（リンク埋め込み済み）",
         data=buf,
         file_name="ev_regulation_result.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -733,8 +866,8 @@ if "df_result" in st.session_state:
 st.markdown("---")
 st.markdown(
     '<p style="text-align:center; color:#a0aec0; font-size:0.85rem;">'
-    'EV充電器設置工事 規制区域自動判定ツール v3.1 | '
-    'GISデータ出典: 国土数値情報（国土交通省）A10-15・A35 | '
+    'EV充電器設置工事 規制区域自動判定ツール v3.3 | '
+    'GISデータ出典: 国土数値情報（国土交通省）A10-15・A35a | '
     'ジオコーディング: 国土地理院'
     '</p>',
     unsafe_allow_html=True,
